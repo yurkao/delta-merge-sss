@@ -1,0 +1,15 @@
+**/*.iml
+*.ipr
+*.iws
+.gradle/
+.vagrant/
+.idea/*
+!.idea/misc.xml
+!.idea/runConfigurations
+build/
+out/
+out
+**/*-local.properties
+*.patch
+*.prejson
+misc.xml
