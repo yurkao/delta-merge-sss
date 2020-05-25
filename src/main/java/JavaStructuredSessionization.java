@@ -148,7 +148,8 @@ public final class JavaStructuredSessionization {
                 final SessionInfo oldSession = state.get();
                 final long durationMs = oldSession.calculateDuration();
                 final int numEvents = oldSession.getNumEvents();
-                SessionUpdate finalUpdate = new SessionUpdate(key, durationMs, numEvents, true);
+                final String sessionId = oldSession.sessionId;
+                SessionUpdate finalUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
                 state.remove();
                 return finalUpdate;
 
@@ -170,10 +171,12 @@ public final class JavaStructuredSessionization {
             // Update start and end timestamps in session
             if (state.exists()) {
                 final SessionInfo oldSession = state.get();
+                updatedSession.sessionId = oldSession.sessionId;
                 updatedSession.setNumEvents(oldSession.numEvents + numNewEvents);
                 updatedSession.setStartTimestampMs(oldSession.startTimestampMs);
                 updatedSession.setEndTimestampMs(Math.max(oldSession.endTimestampMs, maxTimestampMs));
             } else {
+                updatedSession.sessionId = UUID.randomUUID().toString();
                 updatedSession.setNumEvents(numNewEvents);
                 updatedSession.setStartTimestampMs(minTimestampMs);
                 updatedSession.setEndTimestampMs(maxTimestampMs);
@@ -221,6 +224,7 @@ public final class JavaStructuredSessionization {
     @Getter
     @Setter
     public static class SessionInfo implements Serializable {
+        String sessionId;
         private int numEvents = 0;
         private long startTimestampMs = -1;
         private long endTimestampMs = -1;
