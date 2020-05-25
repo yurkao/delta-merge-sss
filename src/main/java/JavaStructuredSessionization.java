@@ -4,7 +4,6 @@ import lombok.Setter;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.FlatMapGroupsWithStateFunction;
 import org.apache.spark.api.java.function.MapFunction;
-import org.apache.spark.api.java.function.MapGroupsWithStateFunction;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.streaming.GroupState;
 import org.apache.spark.sql.streaming.GroupStateTimeout;
@@ -71,11 +70,6 @@ public final class JavaStructuredSessionization {
         // and report session updates.
         //
         // Step 1: Define the state update function
-        // WARNING[YO]: in prod it's better to use FlatMapGroupsWithStateFunction.
-        //  MapGroupsWithStateFunction -> convert many events to single output session
-        //      single session in state (memory), single output session
-        //  FlatMapGroupsWithStateFunction -> convert many events to many output sessions
-        //      single session in state (memory), multiple output sessions
 
         MapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> stateUpdateFunc = new Sessionize();
 
@@ -139,7 +133,7 @@ public final class JavaStructuredSessionization {
          * @param key the return value of GroupByImpl.call
          * @param wordEvents list of wordsEvents matching the @key
          * @param state session state
-         * @return created/updated/expired session
+         * @return created/updated/expired sessions
          */
         @Override
         public SessionUpdate call(String key, Iterator<WordEvent> wordEvents, GroupState<SessionInfo> state) {
@@ -188,8 +182,8 @@ public final class JavaStructuredSessionization {
             final SessionInfo sessionInfo = state.get();
             return new SessionUpdate(key, sessionInfo.calculateDuration(), sessionInfo.getNumEvents(), false);
         }
-
     }
+
     /**
      * User-defined data type representing the raw lines with timestamps.
      */
