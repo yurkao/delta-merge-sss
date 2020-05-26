@@ -7,11 +7,13 @@ import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.streaming.GroupState;
 import org.apache.spark.sql.streaming.GroupStateTimeout;
+import org.apache.spark.sql.streaming.OutputMode;
 import org.apache.spark.sql.streaming.StreamingQuery;
 
 import java.io.Serializable;
 import java.sql.Timestamp;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Counts words in UTF8 encoded, '\n' delimited text received from the network.
@@ -71,15 +73,17 @@ public final class JavaStructuredSessionization {
         //
         // Step 1: Define the state update function
 
-        MapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> stateUpdateFunc = new Sessionize();
+        final long timeoutMs = 10000L; // session timeout is 10 secs
+        FlatMapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> stateUpdateFunc = new Sessionize(timeoutMs);
 
         // Step 2: Apply the state update function to the events streaming Dataset grouped by sessionId
         final Encoder<SessionInfo> stateEncoder = Encoders.bean(SessionInfo.class);
         final Encoder<SessionUpdate> returnValueEncoder = Encoders.bean(SessionUpdate.class);
         final GroupStateTimeout timeoutConf = GroupStateTimeout.ProcessingTimeTimeout();
         Dataset<SessionUpdate> sessionUpdates = events.groupByKey(new GroupByImpl(), Encoders.STRING())
-                .mapGroupsWithState(
+                .flatMapGroupsWithState(
                         stateUpdateFunc,
+                        OutputMode.Update(),
                         stateEncoder,
                         returnValueEncoder,
                         timeoutConf);
@@ -126,8 +130,14 @@ public final class JavaStructuredSessionization {
      * [YO]
      * Simple sesionzation business logic implementation: sessionize words
      */
-    public static class Sessionize implements MapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> {
+    public static class Sessionize implements FlatMapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> {
 
+        private final long sessionTimeoutMs;
+
+        public Sessionize(long sessionTimeoutMs) {
+
+            this.sessionTimeoutMs = sessionTimeoutMs;
+        }
         /**
          *
          * @param key the return value of GroupByImpl.call
@@ -136,7 +146,8 @@ public final class JavaStructuredSessionization {
          * @return created/updated/expired sessions
          */
         @Override
-        public SessionUpdate call(String key, Iterator<WordEvent> wordEvents, GroupState<SessionInfo> state) {
+        public Iterator<SessionUpdate> call(String key, Iterator<WordEvent> wordEvents, GroupState<SessionInfo> state) {
+            final List<SessionUpdate> sessionUpdates =  new ArrayList<>();
             // If timed out, then remove session and send final update
             if (state.hasTimedOut()) {
                 final SessionInfo oldSession = state.get();
@@ -145,42 +156,48 @@ public final class JavaStructuredSessionization {
                 final String sessionId = oldSession.sessionId;
                 SessionUpdate finalUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
                 state.remove();
-                return finalUpdate;
+                sessionUpdates.add(finalUpdate);
+                return sessionUpdates.iterator();
 
             }
-            // [YO] here is a main business logic of sessionization
-            // Find max and min timestamps in events
-            long maxTimestampMs = Long.MIN_VALUE;
-            long minTimestampMs = Long.MAX_VALUE;
-            int numNewEvents = 0;
-            while (wordEvents.hasNext()) {
-                WordEvent e = wordEvents.next();
-                long timestampMs = e.getTimestamp().getTime();
-                maxTimestampMs = Math.max(timestampMs, maxTimestampMs);
-                minTimestampMs = Math.min(timestampMs, minTimestampMs);
-                numNewEvents += 1;
-            }
-            SessionInfo updatedSession = new SessionInfo();
-
-            // Update start and end timestamps in session
+            List<WordEvent> events =  new ArrayList<>();
+            wordEvents.forEachRemaining(events::add);
+            events = events.stream().sorted(Comparator.comparingLong(o -> o.timestamp.getTime())).collect(Collectors.toList());
+            SessionInfo currentSession = null;
             if (state.exists()) {
-                final SessionInfo oldSession = state.get();
-                updatedSession.sessionId = oldSession.sessionId;
-                updatedSession.setNumEvents(oldSession.numEvents + numNewEvents);
-                updatedSession.setStartTimestampMs(oldSession.startTimestampMs);
-                updatedSession.setEndTimestampMs(Math.max(oldSession.endTimestampMs, maxTimestampMs));
-            } else {
-                updatedSession.sessionId = UUID.randomUUID().toString();
-                updatedSession.setNumEvents(numNewEvents);
-                updatedSession.setStartTimestampMs(minTimestampMs);
-                updatedSession.setEndTimestampMs(maxTimestampMs);
+                currentSession = state.get();
             }
-            state.update(updatedSession);
-            // Set timeout such that the session will be expired if no data received for 10 seconds
-            // [YO]: could be configurable via constructor
-            state.setTimeoutDuration("10 seconds");
-            final SessionInfo sessionInfo = state.get();
-            return new SessionUpdate(key, sessionInfo.calculateDuration(), sessionInfo.getNumEvents(), false);
+
+            for (WordEvent event : events) {
+                final long eventTimeMs = event.timestamp.getTime();
+                // current session could be null IFF state.exists is False and we are on first event
+                if(currentSession != null) {
+                    final long timeDiffMs = currentSession.endTimestampMs - eventTimeMs;
+                    // TODO[yo]: handle late events - events that starts before current session startTimestampMs
+                    if (timeDiffMs <= sessionTimeoutMs) {
+                        currentSession.numEvents++;
+                        currentSession.startTimestampMs = Math.max(currentSession.startTimestampMs, eventTimeMs);
+                        currentSession.endTimestampMs = Math.max(currentSession.endTimestampMs, eventTimeMs);
+                        continue;
+                    }
+                    // session timeout
+                    final String sessionId = currentSession.sessionId;
+                    final long durationMs = currentSession.calculateDuration();
+                    final int numEvents = currentSession.getNumEvents();
+
+                    SessionUpdate sessionUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
+                    sessionUpdates.add(sessionUpdate);
+                }
+                currentSession = new SessionInfo();
+                currentSession.sessionId = UUID.randomUUID().toString();
+                currentSession.numEvents++;
+                currentSession.startTimestampMs = eventTimeMs;
+                currentSession.endTimestampMs = eventTimeMs;
+            }
+            state.update(currentSession);
+            state.setTimeoutDuration(sessionTimeoutMs);
+
+            return sessionUpdates.iterator();
         }
     }
 
