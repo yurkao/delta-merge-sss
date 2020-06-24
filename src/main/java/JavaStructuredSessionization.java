@@ -1,17 +1,24 @@
+import io.delta.tables.DeltaTable;
+import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-import org.apache.spark.api.java.function.FlatMapFunction;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.spark.api.java.function.FlatMapGroupsWithStateFunction;
 import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.api.java.function.VoidFunction2;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.streaming.GroupState;
 import org.apache.spark.sql.streaming.GroupStateTimeout;
 import org.apache.spark.sql.streaming.OutputMode;
 import org.apache.spark.sql.streaming.StreamingQuery;
+import org.apache.spark.sql.types.StructType;
 
+import java.io.IOException;
 import java.io.Serializable;
-import java.sql.Timestamp;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -28,59 +35,47 @@ import java.util.stream.Collectors;
  * `$ bin/run-example sql.streaming.JavaStructuredSessionization
  * localhost 9999`
  */
+@Slf4j
 public final class JavaStructuredSessionization {
-
     public static void main(String[] args) throws Exception {
+        final Encoder<RawEvent> rawEventsEncoder = Encoders.bean(RawEvent.class);
+        final StructType inputSchema = rawEventsEncoder.schema();
+        log.warn("Input schema: {}", inputSchema.prettyJson());
         if (args.length < 2) {
-            System.err.println("Usage: JavaStructuredSessionization <hostname> <port>");
+            System.err.println("Usage (foreachBatch + append to delta): JavaStructuredSessionization <in-json-path> <out-delta-path>");
+            System.err.println("Usage (foreachBatch + merge to delta - no persist): JavaStructuredSessionization <in-json-path> <out-delta-path> merge");
+            System.err.println("Usage (foreachBatch + append to delta WITH persist): JavaStructuredSessionization <in-json-path> <out-delta-path> merge+persist");
             System.exit(1);
         }
 
-        String host = args[0];
-        int port = Integer.parseInt(args[1]);
+        final String inPath = args[0];
+        final String outPath = args[1];
 
-        SparkSession spark = SparkSession
-                .builder()
-                .appName("JavaStructuredSessionization")
-                .getOrCreate();
+        final SparkSession spark = SparkSession.builder().getOrCreate();
 
-        // Create DataFrame representing the stream of input lines from connection to host:port
-        Dataset<Row> lines = spark
+
+        final Dataset<Row> df = spark
                 .readStream()
-                .format("socket")
-                .option("host", host)
-                .option("port", port)
-                .option("includeTimestamp", true)
+                .schema(inputSchema)
+                .format("json")
+                .option("path", inPath)
                 .load();
-        /*
-         * [YO]
-         * current dataset schema is:
-         *  value: String
-         *  timestamp: Timestamp
-         */
 
-        FlatMapFunction<LineWithTimestamp, WordEvent> linesToEvents = new LineToWordEvents();
+        final Column recordCol = functions.struct("ip", "fqdn", "tenant_id");
+        final Dataset<Event> events = df
+                .withColumn("watermark", functions.col("event_time_utc_ts").divide(1000).cast("timestamp"))
+                .withWatermark("watermark", "1 minute")
+                .withColumn("record", recordCol)
+                .withColumnRenamed("event_time_utc_ts", "eventTime")
+                .as(Encoders.bean(Event.class));
 
-        // Split the lines into words, treat words as sessionId of events
-        Dataset<WordEvent> events = lines
-                .withColumnRenamed("value", "line")
-                // cast Un-typed dataset (Dataset<Row>) to strictly typed dataset of defined POJO (Dataset<WordEvent>)
-                .as(Encoders.bean(LineWithTimestamp.class))
-                .flatMap(linesToEvents, Encoders.bean(WordEvent.class));
+        final long timeoutMs = 5*60*1000L; // 5 minutes for timeout
+        FlatMapGroupsWithStateFunction<Record, Event, SessionInfo, SessionUpdate> stateUpdateFunc = new Sessionize(timeoutMs);
 
-        // Sessionize the events. Track number of events, start and end timestamps of session, and
-        // and report session updates.
-        //
-        // Step 1: Define the state update function
-
-        final long timeoutMs = 10000L; // session timeout is 10 secs
-        FlatMapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> stateUpdateFunc = new Sessionize(timeoutMs);
-
-        // Step 2: Apply the state update function to the events streaming Dataset grouped by sessionId
         final Encoder<SessionInfo> stateEncoder = Encoders.bean(SessionInfo.class);
         final Encoder<SessionUpdate> returnValueEncoder = Encoders.bean(SessionUpdate.class);
         final GroupStateTimeout timeoutConf = GroupStateTimeout.ProcessingTimeTimeout();
-        Dataset<SessionUpdate> sessionUpdates = events.groupByKey(new GroupByImpl(), Encoders.STRING())
+        Dataset<SessionUpdate> sessionUpdates = events.groupByKey(new GroupByImpl(), Encoders.bean(Record.class))
                 .flatMapGroupsWithState(
                         stateUpdateFunc,
                         OutputMode.Update(),
@@ -88,41 +83,111 @@ public final class JavaStructuredSessionization {
                         returnValueEncoder,
                         timeoutConf);
 
-        // Start running the query that prints the session updates to the console
-        StreamingQuery query = sessionUpdates
+        final VoidFunction2<Dataset<Row>, Long>  sink;
+        if (args.length==3) {
+
+            if ("merge+persist".equals(args[2])) {
+                sink = new DeltaMergePersistSink(spark, outPath);
+            } else {
+                sink = new DeltaMergeSink(spark, outPath);
+            }
+        } else {
+            sink = new DeltaAppendSink(outPath);
+        }
+        log.warn("Using {} sink", sink);
+
+        final StreamingQuery query = sessionUpdates.toDF()
                 .writeStream()
-                .outputMode("update")
-                .format("console")
+                .option("checkpointLocation", outPath + ".checkpoint")
+                .outputMode(OutputMode.Update())
+                .queryName("job")
+                .foreachBatch(sink)
                 .start();
 
         query.awaitTermination();
     }
 
-    /**
-     * [YO]
-     * Map (convert) string line to list of WordEvents
-     */
-    public static class LineToWordEvents implements FlatMapFunction<LineWithTimestamp, WordEvent> {
+    static class DeltaAppendSink implements VoidFunction2<Dataset<Row>, Long> {
+        private final String outPath;
+
+        DeltaAppendSink(String outPath) {
+
+            this.outPath = outPath;
+        }
 
         @Override
-        public Iterator<WordEvent> call(LineWithTimestamp lineWithTimestamp) {
-            ArrayList<WordEvent> eventList = new ArrayList<>();
-            for (String word : lineWithTimestamp.getLine().split(" ")) {
-                eventList.add(new WordEvent(word, lineWithTimestamp.getTimestamp()));
+        public void call(Dataset<Row> batchDf, Long v2) {
+            batchDf.write().format("delta").mode(SaveMode.Append).save(outPath);
+        }
+
+        @Override
+        public String toString() {
+            return "foreachBatch delta append";
+        }
+
+    }
+
+    @Slf4j
+    static class DeltaMergeSink implements VoidFunction2<Dataset<Row>, Long> {
+        final DeltaTable table;
+        final Column upsertMatch;
+
+        DeltaMergeSink(SparkSession spark, String outPath) throws IOException {
+            final Configuration fsConf = spark.sparkContext().hadoopConfiguration();
+            final FileSystem fileSystem = FileSystem.get(fsConf);
+            final boolean exists = fileSystem.exists(new Path(outPath));
+            if (!exists) {
+                final StructType schema = Encoders.bean(SessionUpdate.class).schema();
+                log.warn("Creating DeltaTable {} with output schema {}", outPath, schema.prettyJson());
+                final Dataset<Row> emptyDf = spark.createDataFrame(Collections.emptyList(), schema);
+                emptyDf.write().format("delta").save(outPath);
             }
-            return eventList.iterator();
+            table = DeltaTable.forPath(spark, outPath);
+            upsertMatch = functions.expr("sessions.id = updates.id");
+
+        }
+
+        @Override
+        public void call(Dataset<Row> batchDf, Long batchId) {
+            table.as("sessions").merge(batchDf.as("updates"), upsertMatch)
+                    .whenNotMatched().insertAll()           // new session to be added
+                    .whenMatched()
+                    .updateAll()
+                    .execute();
+        }
+
+        @Override
+        public String toString() {
+            return "foreachBatch delta merge (no persist)";
         }
     }
 
+    static class DeltaMergePersistSink extends DeltaMergeSink {
+        DeltaMergePersistSink(SparkSession spark, String outPath) throws IOException {
+            super(spark, outPath);
+        }
+
+        @Override
+        public void call(Dataset<Row> batchDf, Long batchId) {
+            final Dataset<Row> persistDf = batchDf.persist();
+            super.call(persistDf, batchId);
+            persistDf.unpersist();
+        }
+
+        @Override
+        public String toString() {
+            return "foreachBatch delta merge+persist";
+        }
+    }
 
     /**
      * [YO]
      * simple group by implementation: event is a word
      */
-    public static class GroupByImpl implements MapFunction<WordEvent, String> {
+    public static class GroupByImpl implements MapFunction<Event, Record> {
         @Override
-        public String call(WordEvent wordEvent) {
-            return wordEvent.getWord();
+        public Record call(Event event) {
+            return event.getRecord();
         }
     }
 
@@ -130,14 +195,14 @@ public final class JavaStructuredSessionization {
      * [YO]
      * Simple sesionzation business logic implementation: sessionize words
      */
-    public static class Sessionize implements FlatMapGroupsWithStateFunction<String, WordEvent, SessionInfo, SessionUpdate> {
+    public static class Sessionize implements FlatMapGroupsWithStateFunction<Record, Event, SessionInfo, SessionUpdate> {
 
         private final long sessionTimeoutMs;
 
         public Sessionize(long sessionTimeoutMs) {
-
             this.sessionTimeoutMs = sessionTimeoutMs;
         }
+
         /**
          *
          * @param key the return value of GroupByImpl.call
@@ -146,7 +211,7 @@ public final class JavaStructuredSessionization {
          * @return created/updated/expired sessions
          */
         @Override
-        public Iterator<SessionUpdate> call(String key, Iterator<WordEvent> wordEvents, GroupState<SessionInfo> state) {
+        public Iterator<SessionUpdate> call(Record key, Iterator<Event> wordEvents, GroupState<SessionInfo> state) {
             final List<SessionUpdate> sessionUpdates =  new ArrayList<>();
             // If timed out, then remove session and send final update
             if (state.hasTimedOut()) {
@@ -160,16 +225,16 @@ public final class JavaStructuredSessionization {
                 return sessionUpdates.iterator();
 
             }
-            List<WordEvent> events =  new ArrayList<>();
+            List<Event> events =  new ArrayList<>();
             wordEvents.forEachRemaining(events::add);
-            events = events.stream().sorted(Comparator.comparingLong(o -> o.timestamp.getTime())).collect(Collectors.toList());
+            events = events.stream().sorted(Comparator.comparingLong(e -> e.eventTime)).collect(Collectors.toList());
             SessionInfo currentSession = null;
             if (state.exists()) {
                 currentSession = state.get();
             }
 
-            for (WordEvent event : events) {
-                final long eventTimeMs = event.timestamp.getTime();
+            for (Event event : events) {
+                final long eventTimeMs = event.eventTime;
                 // current session could be null IFF state.exists is False and we are on first event
                 if(currentSession != null) {
                     final long timeDiffMs = currentSession.endTimestampMs - eventTimeMs;
@@ -187,12 +252,16 @@ public final class JavaStructuredSessionization {
 
                     SessionUpdate sessionUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
                     sessionUpdates.add(sessionUpdate);
+                } else {
+                    currentSession = new SessionInfo();
+                    currentSession.sessionId = UUID.randomUUID().toString();
+                    currentSession.numEvents++;
+                    currentSession.startTimestampMs = eventTimeMs;
+                    currentSession.endTimestampMs = eventTimeMs;
+                    final SessionUpdate sessionUpdate = new SessionUpdate(currentSession.sessionId, 0, currentSession.numEvents,false);
+
+                    sessionUpdates.add(sessionUpdate);
                 }
-                currentSession = new SessionInfo();
-                currentSession.sessionId = UUID.randomUUID().toString();
-                currentSession.numEvents++;
-                currentSession.startTimestampMs = eventTimeMs;
-                currentSession.endTimestampMs = eventTimeMs;
             }
             state.update(currentSession);
             state.setTimeoutDuration(sessionTimeoutMs);
@@ -201,31 +270,41 @@ public final class JavaStructuredSessionization {
         }
     }
 
-    /**
-     * User-defined data type representing the raw lines with timestamps.
-     */
-    @NoArgsConstructor // [YO] required for de-serializing POJO object in Spark
     @Getter
     @Setter
-    public static class LineWithTimestamp implements Serializable {
-        private String line;
-        private Timestamp timestamp;
+    @EqualsAndHashCode(onlyExplicitlyIncluded = true)
+    static class RawEvent {
+        private long event_time_utc_ts;
+        private String tenant_id;
+        private String ip;
+        private String fqdn;
     }
 
+
+    @NoArgsConstructor // default constructor (bean) for Spark: row to java object conversion.
+    @EqualsAndHashCode
+    @Getter
+    @Setter
+    public static class Record implements Serializable {
+
+        private String tenant_id;
+        private String ip;
+        private String fqdn;
+    }
     /**
      * User-defined data type representing the input events
      */
     @NoArgsConstructor // [YO] required for de-serializing POJO object in Spark
     @Getter
     @Setter
-    public static class WordEvent implements Serializable {
-        private String word;
-        private Timestamp timestamp;
+    @EqualsAndHashCode(onlyExplicitlyIncluded = true)
+    public static class Event implements Serializable {
+        @EqualsAndHashCode.Include
+        private Record record;
 
-        public WordEvent(String word, Timestamp timestamp) {
-            this.word = word;
-            this.timestamp = timestamp;
-        }
+        @EqualsAndHashCode.Include
+        private long eventTime;
+
     }
 
     /**
@@ -242,10 +321,6 @@ public final class JavaStructuredSessionization {
 
         public long calculateDuration() { return endTimestampMs - startTimestampMs; }
 
-        @Override public String toString() {
-            return "SessionInfo(numEvents = " + numEvents +
-                    ", timestamps = " + startTimestampMs + " to " + endTimestampMs + ")";
-        }
     }
 
     /**
