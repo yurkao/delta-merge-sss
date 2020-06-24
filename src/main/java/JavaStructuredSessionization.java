@@ -219,7 +219,7 @@ public final class JavaStructuredSessionization {
                 final long durationMs = oldSession.calculateDuration();
                 final int numEvents = oldSession.getNumEvents();
                 final String sessionId = oldSession.sessionId;
-                SessionUpdate finalUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
+                final SessionUpdate finalUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
                 state.remove();
                 sessionUpdates.add(finalUpdate);
                 return sessionUpdates.iterator();
@@ -228,41 +228,31 @@ public final class JavaStructuredSessionization {
             List<Event> events =  new ArrayList<>();
             wordEvents.forEachRemaining(events::add);
             events = events.stream().sorted(Comparator.comparingLong(e -> e.eventTime)).collect(Collectors.toList());
-            SessionInfo currentSession = null;
+            final SessionInfo currentSession;
             if (state.exists()) {
                 currentSession = state.get();
+            } else {
+                currentSession = new SessionInfo();
+                currentSession.sessionId = UUID.randomUUID().toString();
+                currentSession.startTimestampMs = Long.MAX_VALUE;
+                currentSession.endTimestampMs = Long.MIN_VALUE;
             }
 
             for (Event event : events) {
                 final long eventTimeMs = event.eventTime;
                 // current session could be null IFF state.exists is False and we are on first event
-                if(currentSession != null) {
-                    final long timeDiffMs = currentSession.endTimestampMs - eventTimeMs;
-                    // TODO[yo]: handle late events - events that starts before current session startTimestampMs
-                    if (timeDiffMs <= sessionTimeoutMs) {
-                        currentSession.numEvents++;
-                        currentSession.startTimestampMs = Math.max(currentSession.startTimestampMs, eventTimeMs);
-                        currentSession.endTimestampMs = Math.max(currentSession.endTimestampMs, eventTimeMs);
-                        continue;
-                    }
-                    // session timeout
-                    final String sessionId = currentSession.sessionId;
-                    final long durationMs = currentSession.calculateDuration();
-                    final int numEvents = currentSession.getNumEvents();
-
-                    SessionUpdate sessionUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
-                    sessionUpdates.add(sessionUpdate);
-                } else {
-                    currentSession = new SessionInfo();
-                    currentSession.sessionId = UUID.randomUUID().toString();
-                    currentSession.numEvents++;
-                    currentSession.startTimestampMs = eventTimeMs;
-                    currentSession.endTimestampMs = eventTimeMs;
-                    final SessionUpdate sessionUpdate = new SessionUpdate(currentSession.sessionId, 0, currentSession.numEvents,false);
-
-                    sessionUpdates.add(sessionUpdate);
-                }
+                currentSession.startTimestampMs = Math.min(eventTimeMs, currentSession.startTimestampMs);
+                currentSession.numEvents++;
+                currentSession.endTimestampMs = Math.max(eventTimeMs, currentSession.startTimestampMs);
             }
+
+            // session timeout
+            final String sessionId = currentSession.sessionId;
+            final long durationMs = currentSession.calculateDuration();
+            final int numEvents = currentSession.getNumEvents();
+
+            SessionUpdate sessionUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
+            sessionUpdates.add(sessionUpdate);
             state.update(currentSession);
             state.setTimeoutDuration(sessionTimeoutMs);
 
