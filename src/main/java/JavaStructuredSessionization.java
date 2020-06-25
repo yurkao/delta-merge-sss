@@ -55,8 +55,6 @@ public final class JavaStructuredSessionization {
                 .schema(inputSchema)
                 .format("json")
                 .option("path", inPath)
-                .option("maxFilesPerTrigger", "1")
-                .option("latestFirst", "false")
                 .load();
 
         final Column recordCol = functions.struct("ip", "fqdn", "tenant_id");
