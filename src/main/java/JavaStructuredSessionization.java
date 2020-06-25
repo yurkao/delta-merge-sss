@@ -231,10 +231,13 @@ public final class JavaStructuredSessionization {
             final List<Event> events =  new ArrayList<>();
             wordEvents.forEachRemaining(events::add);
             events.sort(Comparator.comparingLong(e -> e.eventTime));
-            final SessionInfo currentSession;
+            SessionInfo currentSession;
+            final boolean updated;
             if (state.exists()) {
                 currentSession = state.get();
+                updated = true;
             } else {
+                updated = false;
                 currentSession = new SessionInfo();
                 currentSession.sessionId = UUID.randomUUID().toString();
                 currentSession.startTimestampMs = Long.MAX_VALUE;
@@ -243,22 +246,29 @@ public final class JavaStructuredSessionization {
 
             for (Event event : events) {
                 final long eventTimeMs = event.eventTime;
-                // current session could be null IFF state.exists is False and we are on first event
                 currentSession.startTimestampMs = Math.min(eventTimeMs, currentSession.startTimestampMs);
                 currentSession.numEvents++;
                 currentSession.endTimestampMs = Math.max(eventTimeMs, currentSession.startTimestampMs);
             }
 
-            // session timeout
+            if (updated) {
+                // session object should be updated - otherwise the spark state will not be updated
+                // and will be timed-out
+                final SessionInfo updatedSession = new SessionInfo();
+                updatedSession.numEvents = currentSession.numEvents;
+                updatedSession.sessionId = currentSession.sessionId;
+                updatedSession.startTimestampMs = currentSession.startTimestampMs;
+                updatedSession.endTimestampMs = currentSession.endTimestampMs;
+                currentSession = updatedSession;
+            }
+
+            state.update(currentSession);
+            state.setTimeoutDuration(sessionTimeoutMs);
             final String sessionId = currentSession.sessionId;
             final long durationMs = currentSession.calculateDuration();
             final int numEvents = currentSession.getNumEvents();
-
-            SessionUpdate sessionUpdate = new SessionUpdate(sessionId, durationMs, numEvents, true);
+            final SessionUpdate sessionUpdate = new SessionUpdate(sessionId, durationMs, numEvents, false);
             sessionUpdates.add(sessionUpdate);
-            state.update(currentSession);
-            state.setTimeoutDuration(sessionTimeoutMs);
-
             return sessionUpdates.iterator();
         }
     }
