@@ -232,12 +232,13 @@ public final class JavaStructuredSessionization {
             wordEvents.forEachRemaining(events::add);
             events.sort(Comparator.comparingLong(e -> e.eventTime));
             SessionInfo currentSession;
-            final boolean updated;
+            final boolean created;
+
             if (state.exists()) {
                 currentSession = state.get();
-                updated = true;
+                created = false;
             } else {
-                updated = false;
+                created = true;
                 currentSession = new SessionInfo();
                 currentSession.sessionId = UUID.randomUUID().toString();
                 currentSession.startTimestampMs = Long.MAX_VALUE;
@@ -251,9 +252,9 @@ public final class JavaStructuredSessionization {
                 currentSession.endTimestampMs = Math.max(eventTimeMs, currentSession.startTimestampMs);
             }
 
-            if (updated) {
-                // session object should be updated - otherwise the spark state will not be updated
-                // and will be timed-out
+            if (!created) {
+                // new session object should be created - otherwise the spark state will not be updated
+                // with old POJO and will be timed-out
                 final SessionInfo updatedSession = new SessionInfo();
                 updatedSession.numEvents = currentSession.numEvents;
                 updatedSession.sessionId = currentSession.sessionId;
