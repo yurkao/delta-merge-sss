@@ -11,16 +11,12 @@ import org.apache.spark.api.java.function.FlatMapGroupsWithStateFunction;
 import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.api.java.function.VoidFunction2;
 import org.apache.spark.sql.*;
-import org.apache.spark.sql.streaming.GroupState;
-import org.apache.spark.sql.streaming.GroupStateTimeout;
-import org.apache.spark.sql.streaming.OutputMode;
-import org.apache.spark.sql.streaming.StreamingQuery;
+import org.apache.spark.sql.streaming.*;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Counts words in UTF8 encoded, '\n' delimited text received from the network.
@@ -59,6 +55,8 @@ public final class JavaStructuredSessionization {
                 .schema(inputSchema)
                 .format("json")
                 .option("path", inPath)
+                .option("maxFilesPerTrigger", "1")
+                .option("latestFirst", "false")
                 .load();
 
         final Column recordCol = functions.struct("ip", "fqdn", "tenant_id");
@@ -96,21 +94,26 @@ public final class JavaStructuredSessionization {
         }
         log.warn("Using {} sink", sink);
 
+        final Trigger trigger = Trigger.ProcessingTime(0);
+        log.warn("Using trigger: {}", trigger);
         final StreamingQuery query = sessionUpdates.toDF()
                 .writeStream()
                 .option("checkpointLocation", outPath + ".checkpoint")
                 .outputMode(OutputMode.Update())
                 .queryName("job")
+                .trigger(trigger)
                 .foreachBatch(sink)
                 .start();
 
         query.awaitTermination();
     }
 
+    @Slf4j
     static class DeltaAppendSink implements VoidFunction2<Dataset<Row>, Long> {
         private final String outPath;
 
         DeltaAppendSink(String outPath) {
+            log.info("Saving output to {}", outPath);
 
             this.outPath = outPath;
         }
@@ -225,9 +228,9 @@ public final class JavaStructuredSessionization {
                 return sessionUpdates.iterator();
 
             }
-            List<Event> events =  new ArrayList<>();
+            final List<Event> events =  new ArrayList<>();
             wordEvents.forEachRemaining(events::add);
-            events = events.stream().sorted(Comparator.comparingLong(e -> e.eventTime)).collect(Collectors.toList());
+            events.sort(Comparator.comparingLong(e -> e.eventTime));
             final SessionInfo currentSession;
             if (state.exists()) {
                 currentSession = state.get();
